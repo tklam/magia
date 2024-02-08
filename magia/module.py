@@ -8,6 +8,7 @@ from os import PathLike
 from pathlib import Path
 from string import Template
 from typing import Optional, Union
+from abc import ABC
 
 from .constants import SignalType
 from .core import Input, Output, Signal, SignalDict, Synthesizable

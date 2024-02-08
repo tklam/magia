@@ -7,7 +7,8 @@ from itertools import count
 from math import ceil
 from pathlib import Path
 from string import Template
-from typing import Optional, Union
+from typing import Optional, Union, Self
+from abc import abstractmethod, ABC
 
 from .constants import OPType, RegType, SignalType
 
@@ -878,6 +879,7 @@ class Operation(Signal):
         elif op_type == OPType.LSHIFT or op_type == OPType.RSHIFT:
             if not isinstance(y, int):
                 raise TypeError("Shifting Operator only support constant shifting with integer.")
+
         else:
             if isinstance(y, (int, bytes)):
                 y = Constant(y, len(x), x.signed)
@@ -1010,7 +1012,7 @@ class Case(Operation):
         if any(k >= 2 ** len(selector) for k in cases):
             raise ValueError("Selector value is out of range.")
 
-        # Inference the width of the output signal
+        # Infer the width of the output signal
         output_signals = list(cases.values()) + ([] if default is None else [default])
         if any(isinstance(v, Signal) for v in output_signals):
             signal_width = {len(sig) for sig in output_signals if isinstance(sig, Signal)}
@@ -1019,17 +1021,22 @@ class Case(Operation):
                 raise ValueError("All drivers must have the same width.")
             if len(signal_signed) != 1:
                 raise ValueError("All drivers must have the same signedness.")
-            output_width = next(iter(signal_width))
-            output_signed = next(iter(signal_signed))
+            self._output_width = next(iter(signal_width))
+            self._output_signed = next(iter(signal_signed))
 
-            if output_width == 0:
+            if self._output_width == 0:
                 raise ValueError("Width of the output signal cannot be inferred.")
         else:
             # All drivers are int
-            output_width = max(max(v.bit_length() for v in output_signals), 1)
-            output_signed = any(v < 0 for v in output_signals)
+            self._output_width = max(max(v.bit_length() for v in output_signals), 1)
+            self._output_signed = any(v < 0 for v in output_signals)
 
-        super().__init__(op_type=OPType.CASE, width=output_width, signed=output_signed, **kwargs)
+        super().__init__(
+            op_type=OPType.CASE,
+            width=self._output_width,
+            signed=self._output_signed,
+            **kwargs,
+        )
 
         # Make a shallow copy of the cases
         self._cases = dict(cases.items())
@@ -1037,6 +1044,7 @@ class Case(Operation):
             unique=len(cases) == 2 ** len(selector),
             default=default,
         )
+        self._optimized_cases = None  # optimized cases
 
         # Assign the Drivers
         self._drivers[self.SINGLE_DRIVER_NAME] = selector
@@ -1051,6 +1059,18 @@ class Case(Operation):
     def _driver_name(case: int) -> str:
         return f"case_{case}"
 
+    @property
+    def cases(self) -> dict[Union[int], Union[Signal, int]]:
+        return self._cases
+
+    @property
+    def output_width(self) -> int:
+        return self._output_width
+
+    @property
+    def output_signed(self) -> bool:
+        return self._output_signed
+
     def elaborate(self) -> str:
         def driver_value(sig_or_const: Optional[Union[Signal, int]]) -> str:
             if isinstance(sig_or_const, Signal):
@@ -1060,28 +1080,51 @@ class Case(Operation):
         signal_decl = self.signal_decl()
         case_table = []
 
-        for selector_value, driver in self._cases.items():
-            driver = driver.net_name if isinstance(driver, Signal) else Constant.sv_constant(driver, len(self),
-                                                                                             self.signed)
-            case_table.append(
-                self._CASE_ITEM_TEMPLATE.substitute(
-                    selector_value=Constant.sv_constant(
-                        selector_value,
-                        len(self._drivers[self.SINGLE_DRIVER_NAME]), False
-                    ),
-                    output=self.net_name,
-                    driver=driver,
+        if self._optimized_cases is None:
+            for selector_value, driver in self._cases.items():
+                driver = (
+                    driver.net_name
+                    if isinstance(driver, Signal)
+                    else Constant.sv_constant(driver, len(self), self.signed)
                 )
-            )
+                case_table.append(
+                    self._CASE_ITEM_TEMPLATE.substitute(
+                        selector_value=Constant.sv_constant(
+                            selector_value,
+                            len(self._drivers[self.SINGLE_DRIVER_NAME]),
+                            False,
+                        ),
+                        output=self.net_name,
+                        driver=driver,
+                    )
+                )
 
-        if not self._case_config.unique:
-            case_table.append(
-                self._CASE_ITEM_TEMPLATE.substitute(
-                    selector_value="default",
-                    output=self.net_name,
-                    driver=driver_value(self._case_config.default),
+            if not self._case_config.unique:
+                case_table.append(
+                    self._CASE_ITEM_TEMPLATE.substitute(
+                        selector_value="default",
+                        output=self.net_name,
+                        driver=driver_value(self._case_config.default),
+                    )
                 )
-            )
+        else:
+            for selector_value, driver in self._optimized_cases.items():
+                driver = (
+                    driver.net_name
+                    if isinstance(driver, Signal)
+                    else Constant.sv_constant(driver, len(self), self.signed)
+                )
+                case_table.append(
+                    self._CASE_ITEM_TEMPLATE.substitute(
+                        selector_value=Constant.sv_constant(
+                            selector_value,
+                            len(self._drivers[self.SINGLE_DRIVER_NAME]),
+                            False,
+                        ),
+                        output=self.net_name,
+                        driver=driver,
+                    )
+                )
 
         case_impl = self._CASE_TEMPLATE.substitute(
             selector=self._drivers[self.SINGLE_DRIVER_NAME].net_name,
@@ -1089,6 +1132,60 @@ class Case(Operation):
             unique="unique" if self._case_config.unique else "",
         )
         return "\n".join((signal_decl, case_impl))
+
+    class CaseOptimizer(ABC):
+        """
+        Am abstruct class implementing methods to optimize `Case` with non-unique cases
+        """
+
+        @abstractmethod
+        def optimize(
+            self, cases: dict[Union[int], Union[Signal, int]]
+        ) -> dict[Union[int], Union[Signal, int]]:
+            return {}
+
+    def optimize(self, case_optimizer: CaseOptimizer) -> Self:
+        """
+        Optimize the case table if it is not fully defined so that no more default statment is added.
+
+        E.g.
+
+        Given the following Python:
+            case_optimizer = SingleOutputCaseOptimizerQM()
+            # sel <<= {a @ b @c}
+            # q[0]: !a!b!c
+            # q[1]: (not defined)
+            # q[2]: !a!b!c + a!bc
+            self.io.q <<= sel.case(
+                cases={
+                    0x0: 0x05,
+                    0x5: 0x04,
+                },
+            ).optimize(case_optimizer)
+
+        would result the following SystemVerilog:
+            logic  [2:0] sel;
+            logic  [2:0] net_7;
+            always_comb
+            # q[0]: !a
+            # q[1]: b
+            # q[2]: 1
+            case (sel)
+                3'h0: net_7 = 3'h5;
+                3'h1: net_7 = 3'h5;
+                3'h2: net_7 = 3'h7;
+                3'h3: net_7 = 3'h7;
+                3'h4: net_7 = 3'h4;
+                3'h5: net_7 = 3'h4;
+                3'h6: net_7 = 3'h6;
+                3'h7: net_7 = 3'h6;
+            endcase
+            assign q = net_7;
+
+        """
+        if not self._case_config.unique:
+            self._optimized_cases = case_optimizer.optimize(self)
+        return self
 
 
 class Register(Operation):
